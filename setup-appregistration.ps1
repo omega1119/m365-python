@@ -1,103 +1,74 @@
-# -------------------------------
-# Parameters - Update these as needed
-# -------------------------------
-$appName = "GraphAPIExampleApp"
-$yearsValid = 1                                # Client secret valid for 1 year
+# Define parameters
+$AppName = "M365GraphAPIApp"
 
-# -------------------------------
-# Step 0: Retrieve and Output Tenant ID
-# -------------------------------
-Write-Output "Retrieving Tenant ID..."
-$tenantId = az account show --query tenantId --output json | ConvertFrom-Json
-if ([string]::IsNullOrEmpty($tenantId)) {
-    Write-Output "Error retrieving Tenant ID. Ensure you are logged in with 'az login'."
-    exit 1
-}
-Write-Output "Tenant ID: $tenantId"
-
-# -------------------------------
-# Step 1: Create the App Registration
-# -------------------------------
-Write-Output "Creating app registration..."
-$appJson = az ad app create `
-    --display-name $appName `
-    --output json | ConvertFrom-Json
-
-$appId = $appJson.appId
-$appObjectId = $appJson.objectId
-
-Write-Output "App created."
-Write-Output "App ID: $appId"
-Write-Output "Object ID: $appObjectId"
-
-# -------------------------------
-# Step 2: Check for or Create a Service Principal for the App
-# -------------------------------
-Write-Output "Checking for existing Service Principal..."
-$spId = $null
-try {
-    $spObjectId = az ad sp show --id $appId --output json | ConvertFrom-Json
-    if ($spObjectId) {
-        Write-Output "Service Principal already exists with Object ID: $spObjectId"
-        
-    }
-    else {
-        Write-Output "No existing Service Principal found. Creating one..."
-        $spObjectId = az ad sp create --id $appId --output json | ConvertFrom-Json
-        Write-Output "Created Service Principal with Object ID: $spObjectId"
-    }
-    $spId = $spObjectId.id
-}
-catch {
-    Write-Output "Error checking for Service Principal. Creating a new one..."
-    $spObjectId = az ad sp create --id $appId --output json | ConvertFrom-Json
-    Write-Output "Created Service Principal with Object ID: $spObjectId"
+# Check if already logged in
+$LoggedIn = az account show --query "id" -o tsv 2>$null
+if (-not $LoggedIn) {
+    Write-Output "Not logged in. Running az login..."
+    az login
+} else {
+    Write-Output "Already logged in."
 }
 
-# -------------------------------
-# Step 3: Create a Client Secret
-# -------------------------------
-Write-Output "Creating client secret..."
-$secretJson = az ad app credential reset `
-    --id $appId `
-    --append `
-    --years $yearsValid `
-    --query "{clientSecret: password}" `
-    --output json | ConvertFrom-Json
+# Get Tenant ID from Azure CLI
+$TenantId = az account show --query "tenantId" -o tsv
+Write-Output "Tenant ID: $TenantId"
 
-$clientSecret = $secretJson.clientSecret
+# Check if the app already exists
+$ExistingAppId = az ad app list --filter "displayName eq '$AppName'" --query "[0].appId" -o tsv
+if ($ExistingAppId) {
+    Write-Output "Application already exists with App ID: $ExistingAppId"
+    $AppId = $ExistingAppId
+} else {
+    # Create the App Registration
+    $AppId = az ad app create --display-name $AppName --query appId -o tsv
+    Write-Output "New App ID: $AppId"
+}
 
-Write-Output "Client secret created."
-Write-Output "Client Secret: $clientSecret"
-Write-Output "Make sure to store this secret securely. It will not be displayed again."
+# Check if a client secret exists
+$ExistingSecretId = az ad app credential list --id $AppId --query "[0].keyId" -o tsv
 
-# -------------------------------
-# Step 4: Add Microsoft Graph API Permissions
-# -------------------------------
-Write-Output "Adding Microsoft Graph API permissions..."
-# Microsoft Graph resource ID
-$graphResourceId = "00000003-0000-0000-c000-000000000000"
-# Delegated permission IDs for Microsoft Graph:
-#   User.Read: e1fe6dd8-ba31-4d61-89e7-88639da4683d
-#   User.Read.All: df021288-bdef-4463-88db-98f22de89214
-az ad app permission add --id $appId --api $graphResourceId --api-permissions "df021288-bdef-4463-88db-98f22de89214=Scope"
+if ($ExistingSecretId) {
+    Write-Output "Existing secret found. Recycling..."
+    az ad app credential delete --id $AppId --key-id $ExistingSecretId
+}
 
-Write-Output "Permissions added."
+# Create a new Client Secret
+$ClientSecret = az ad app credential reset --id $AppId --query password -o tsv
+Write-Output "New Client Secret: $ClientSecret"
 
-# -------------------------------
-# Step 5: Grant Admin Consent (Optional)
-# -------------------------------
-Write-Output "To grant admin consent for these permissions, run:"
-Write-Output "az ad app permission admin-consent --id $appId"
+# Assign API Permissions (User.Read.All and Directory.Read.All for Graph API)
+# https://learn.microsoft.com/en-us/graph/permissions-reference
+# User.Read.All
+az ad app permission add --id $AppId --api 00000003-0000-0000-c000-000000000000 --api-permissions df021288-bdef-4463-88db-98f22de89214=Role
+# Directory.Read.All
+az ad app permission add --id $AppId --api 00000003-0000-0000-c000-000000000000 --api-permissions 7ab1d382-f21e-4acd-a863-ba3e13f7da61=Role
 
-# -------------------------------
-# Summary Output
-# -------------------------------
-Write-Output "-------------------------------"
-Write-Output "App Registration Setup Complete"
-Write-Output "App Name: $appName"
-Write-Output "App ID: $appId"
-Write-Output "Service Principal ID: $spId"
-Write-Output "Client Secret: $clientSecret"
-Write-Output "  Tenant ID: $tenantId"
-Write-Output "-------------------------------"
+# Grant admin consent
+az ad app permission admin-consent --id $AppId
+
+# Explicitly grant permissions to make them effective
+az ad app permission grant --id $AppId --api 00000003-0000-0000-c000-000000000000 --scope User.Read.All 
+az ad app permission grant --id $AppId --api 00000003-0000-0000-c000-000000000000 --scope Directory.Read.All
+
+# Check if the service principal exists
+$ExistingSPId = az ad sp list --filter "appId eq '$AppId'" --query "[0].id" -o tsv
+if (!$ExistingSPId) {
+    # Create a Service Principal if it doesn't exist
+    az ad sp create --id $AppId
+}
+
+# Save credentials to a file for use in the Jupyter Notebook
+$Config = @{
+    "tenant_id" = "$TenantId"
+    "client_id" = "$AppId"
+    "client_secret" = "$ClientSecret"
+}
+$Config | ConvertTo-Json | Set-Content -Path "./config.json"
+Write-Output "Configuration saved to config.json"
+
+# Output the required details
+Write-Output "Application registration process completed successfully!"
+Write-Output "App ID: $AppId"
+Write-Output "New Client Secret: $ClientSecret"
+Write-Output "Tenant ID: $TenantId"
